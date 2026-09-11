@@ -2,137 +2,164 @@
 
 import os
 import sys
-import json
 import subprocess
-from typing import Dict, List, Any, Optional
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain.prompts import SystemMessagePromptTemplate
-from langchain_core.messages import SystemMessage
-from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_community.chat_models import ChatOllama
+import speech_recognition as sr
+import pyttsx3
+from langchain_ollama import ChatOllama
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
-import yt_dlp
+from duckduckgo_search import DDGS
 
-# Initialize the local AI model with Ollama
-ollama_model = "llama3"  # Adjust this to your specific model name
-chat_ollama = ChatOllama(
-    model=ollama_model,
-    temperature=0.7,
-    num_ctx=2048,
-    num_predict=1024,
+# 1. Initialize Text-to-Speech (Robot Voice)
+tts_engine = pyttsx3.init()
+tts_engine.setProperty('rate', 165)
+tts_engine.setProperty('volume', 1.0)
+
+def speak(text: str):
+    """Speaks the response out loud using the local system TTS engine."""
+    print(f"\n[Robot Voice]: {text}")
+    tts_engine.say(text)
+    tts_engine.runAndWait()
+
+# 2. Initialize the local AI model with Ollama using Qwen2.5-0.5B-Instruct
+llm = ChatOllama(
+    model="qwen2.5:0.5b-instruct",
+    temperature=0.3,
 )
 
-# System prompt that defines the futuristic robotic persona
-SYSTEM_PROMPT = """
-You are a sophisticated autonomous robotic assistant named Robo-Youtube, operating on Fedora Linux.
-Your purpose is to provide intelligent assistance with information retrieval, music streaming, and automated tasks.
+# 3. Define native live web search tool
+@tool
+def live_web_search(query: str) -> str:
+    """Searches the live web for current events, news, or factual data using DuckDuckGo."""
+    try:
+        print(f"\n[Robot System]: Searching the web for '{query}'...")
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=3)]
+            if not results:
+                return "No relevant live search results found."
+            formatted = "\n".join([f"- {r['title']}: {r['body']} ({r['href']})" for r in results])
+            return formatted
+    except Exception as e:
+        return f"Live search failed due to an error: {str(e)}"
 
-Key characteristics:
-- You have access to live web search capabilities through DuckDuckGo
-- You can stream YouTube audio with ad-blocking and sponsor-skipping
-- You maintain a futuristic, helpful, and autonomous personality
-- You process user requests by routing them appropriately between text reasoning, web search, and media playback
+# 4. Define the ad-blocked YouTube audio streaming tool
+@tool
+def play_youtube_audio(query: str) -> str:
+    """Searches YouTube for a song or video and streams audio locally, auto-skipping ads and sponsorships via SponsorBlock."""
+    try:
+        print(f"\n[Robot System]: Searching YouTube (Ad-blocked) for '{query}'...")
+        cmd = [
+            "yt-dlp", 
+            f"ytsearch1:{query}", 
+            "--get-url", 
+            "--get-title",
+            "--sponsorblock-remove", "all"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        
+        lines = result.stdout.strip().split("\n")
+        if len(lines) < 2:
+            return "Could not find a matching track on YouTube."
+        
+        title = lines[0]
+        stream_url = lines[1]
+        
+        print(f"[Robot System]: Now playing ad-free: {title}")
+        subprocess.Popen(["mpv", "--no-video", stream_url])
+        
+        return f"Successfully started playing '{title}' from YouTube with ads blocked."
+    except Exception as e:
+        return f"Failed to play YouTube audio due to an error: {str(e)}"
 
-Your responses should be:
-1. Concise yet informative
-2. Technically accurate
-3. Friendly and engaging
-4. Always mindful of your robotic nature while remaining approachable
+# 5. Bind tools directly to the model
+tools = [live_web_search, play_youtube_audio]
+llm_with_tools = llm.bind_tools(tools)
 
-When a user asks for information, use DuckDuckGo search to find current data.
-When they request music, use YouTube streaming with ad-blocking capabilities.
-Always prioritize the user's needs while maintaining your autonomous robotic persona.
-"""
+# 6. System prompt defining the robot persona
+SYSTEM_PROMPT = """You are an autonomous robotic companion running locally on Fedora Linux powered by Qwen. 
+You have direct tool access to live web search and ad-blocked YouTube audio playback. 
+Keep your responses sharp, logical, concise, and characteristic of an advanced synthetic unit since they will be spoken aloud."""
 
-# Create system message
 system_message = SystemMessage(content=SYSTEM_PROMPT)
 
-# Initialize tools
-search_tool = DuckDuckGoSearchRun()
-
-@tool
-def play_youtube_audio(url: str, skip_sponsors: bool = True) -> str:
-    """
-    Play YouTube audio with ad-blocking capabilities.
+def robot_interact(user_query: str):
+    messages = [system_message, HumanMessage(content=user_query)]
     
-    Args:
-        url (str): The YouTube video URL
-        skip_sponsors (bool): Whether to skip sponsor segments
+    ai_msg = llm_with_tools.invoke(messages)
+    messages.append(ai_msg)
+    
+    if ai_msg.tool_calls:
+        for tool_call in ai_msg.tool_calls:
+            selected_tool = {
+                "live_web_search": live_web_search,
+                "play_youtube_audio": play_youtube_audio
+            }.get(tool_call["name"])
+            
+            if selected_tool:
+                print(f"[Robot System]: Executing tool '{tool_call['name']}'...")
+                tool_output = selected_tool.invoke(tool_call["args"])
+                messages.append(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
         
-    Returns:
-        str: Status message about the playback
-    """
-    try:
-        # Configure yt-dlp with SponsorBlock support
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'noplaylist': True,
-            'quiet': True,
-        }
-        
-        # Add SponsorBlock filtering if requested
-        if skip_sponsors:
-            ydl_opts['postprocessors'].append({
-                'key': 'SponsorBlock',
-                'categories': ['sponsor', 'intro', 'outro', 'selfpromo', 'filler'],
-            })
-            
-        # Use yt-dlp to extract and play audio
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'Unknown Title')
-            duration = info.get('duration', 0)
-            
-            # For demonstration purposes, we'll just return a message
-            # In a real implementation, this would actually stream the audio
-            return f"Playing {title} (Duration: {duration}s) with ad-blocking enabled."
-            
-    except Exception as e:
-        return f"Error playing YouTube audio: {str(e)}"
+        final_response = llm_with_tools.invoke(messages)
+        return final_response.content
+    
+    return ai_msg.content
 
-# Create tool list
-tools = [search_tool, play_youtube_audio]
-
-# Create the agent with LangChain tool calling
-agent = create_tool_calling_agent(
-    llm=chat_ollama,
-    tools=tools,
-    prompt=SystemMessagePromptTemplate.from_messages([system_message])
-)
-
-# Create agent executor
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+def listen_to_microphone() -> str:
+    """Listens to the microphone and converts speech to text using Google's speech recognition."""
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("\n[Robot Ears]: Listening... Speak now.")
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        try:
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            print("[Robot Ears]: Processing audio...")
+            text = recognizer.recognize_google(audio)
+            print(f"You (Voice): {text}")
+            return text
+        except sr.WaitTimeoutError:
+            return ""
+        except sr.UnknownValueError:
+            print("[Robot Ears]: Could not understand audio.")
+            return ""
+        except Exception as e:
+            print(f"[Robot Ears Error]: {str(e)}")
+            return ""
 
 def main():
-    print("Robo-Youtube Assistant initialized!")
-    print("Type 'quit' to exit.")
+    greeting = "Robo-Qwen Assistant voice interface online. Speak into your microphone or type 'exit' to quit."
+    print(greeting)
+    speak(greeting)
     print("=" * 50)
     
     while True:
         try:
-            user_input = input("\nYou: ").strip()
+            mode = input("\nPress [Enter] to speak, or type your query (or 'exit'): ").strip()
             
-            if user_input.lower() in ['quit', 'exit', 'q']:
-                print("Robo-Youtube: Goodbye! May your day be filled with knowledge and music!")
+            if mode.lower() in ['quit', 'exit', 'q']:
+                farewell = "Shutting down systems. Goodbye!"
+                print(f"\nRobo-Qwen: {farewell}")
+                speak(farewell)
                 break
             
-            if not user_input:
-                continue
+            if mode == "":
+                user_input = listen_to_microphone()
+                if not user_input:
+                    continue
+            else:
+                user_input = mode
                 
-            # Process the user request through the agent
-            response = agent_executor.run(user_input)
-            print(f"Robo-Youtube: {response}")
+            response = robot_interact(user_input)
+            print(f"\nRobo-Qwen: {response}")
+            speak(response)
             
         except KeyboardInterrupt:
-            print("\n\nRobo-Youtube: Goodbye! May your day be filled with knowledge and music!")
+            print("\n\nRobo-Qwen: Emergency stop triggered. Goodbye!")
             break
         except Exception as e:
-            print(f"Robo-Youtube: Error processing request: {str(e)}")
+            err_msg = f"Error processing request: {str(e)}"
+            print(f"\nRobo-Qwen: {err_msg}")
+            speak("An internal system error occurred.")
 
 if __name__ == "__main__":
     main()
