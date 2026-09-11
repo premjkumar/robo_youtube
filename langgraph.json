@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "voice_assistant": "./assistant_graph.py:graph"
+  },
+  "env": ".env"
+}

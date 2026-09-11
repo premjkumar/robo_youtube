@@ -1,165 +1,267 @@
-#!/usr/bin/env python3
-
-import os
-import sys
+import threading
+import queue
+import time
+import tkinter as tk
+from tkinter import scrolledtext, ttk
 import subprocess
+import tempfile
+import os
 import speech_recognition as sr
-import pyttsx3
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
-from duckduckgo_search import DDGS
 
-# 1. Initialize Text-to-Speech (Robot Voice)
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 165)
-tts_engine.setProperty('volume', 1.0)
+from langchain_community.llms import Ollama
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.checkpoint.memory import MemorySaver
 
-def speak(text: str):
-    """Speaks the response out loud using the local system TTS engine."""
-    print(f"\n[Robot Voice]: {text}")
-    tts_engine.say(text)
-    tts_engine.runAndWait()
-
-# 2. Initialize the local AI model with Ollama using Qwen2.5-0.5B-Instruct
-llm = ChatOllama(
-    model="qwen2.5:0.5b-instruct",
-    temperature=0.3,
-)
-
-# 3. Define native live web search tool
-@tool
-def live_web_search(query: str) -> str:
-    """Searches the live web for current events, news, or factual data using DuckDuckGo."""
-    try:
-        print(f"\n[Robot System]: Searching the web for '{query}'...")
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=3)]
-            if not results:
-                return "No relevant live search results found."
-            formatted = "\n".join([f"- {r['title']}: {r['body']} ({r['href']})" for r in results])
-            return formatted
-    except Exception as e:
-        return f"Live search failed due to an error: {str(e)}"
-
-# 4. Define the ad-blocked YouTube audio streaming tool
-@tool
-def play_youtube_audio(query: str) -> str:
-    """Searches YouTube for a song or video and streams audio locally, auto-skipping ads and sponsorships via SponsorBlock."""
-    try:
-        print(f"\n[Robot System]: Searching YouTube (Ad-blocked) for '{query}'...")
-        cmd = [
-            "yt-dlp", 
-            f"ytsearch1:{query}", 
-            "--get-url", 
-            "--get-title",
-            "--sponsorblock-remove", "all"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        
-        lines = result.stdout.strip().split("\n")
-        if len(lines) < 2:
-            return "Could not find a matching track on YouTube."
-        
-        title = lines[0]
-        stream_url = lines[1]
-        
-        print(f"[Robot System]: Now playing ad-free: {title}")
-        subprocess.Popen(["mpv", "--no-video", stream_url])
-        
-        return f"Successfully started playing '{title}' from YouTube with ads blocked."
-    except Exception as e:
-        return f"Failed to play YouTube audio due to an error: {str(e)}"
-
-# 5. Bind tools directly to the model
-tools = [live_web_search, play_youtube_audio]
-llm_with_tools = llm.bind_tools(tools)
-
-# 6. System prompt defining the robot persona
-SYSTEM_PROMPT = """You are an autonomous robotic companion running locally on Fedora Linux powered by Qwen. 
-You have direct tool access to live web search and ad-blocked YouTube audio playback. 
-Keep your responses sharp, logical, concise, and characteristic of an advanced synthetic unit since they will be spoken aloud."""
-
-system_message = SystemMessage(content=SYSTEM_PROMPT)
-
-def robot_interact(user_query: str):
-    messages = [system_message, HumanMessage(content=user_query)]
-    
-    ai_msg = llm_with_tools.invoke(messages)
-    messages.append(ai_msg)
-    
-    if ai_msg.tool_calls:
-        for tool_call in ai_msg.tool_calls:
-            selected_tool = {
-                "live_web_search": live_web_search,
-                "play_youtube_audio": play_youtube_audio
-            }.get(tool_call["name"])
-            
-            if selected_tool:
-                print(f"[Robot System]: Executing tool '{tool_call['name']}'...")
-                tool_output = selected_tool.invoke(tool_call["args"])
-                messages.append(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
-        
-        final_response = llm_with_tools.invoke(messages)
-        return final_response.content
-    
-    return ai_msg.content
-
-def listen_to_microphone() -> str:
-    """Listens to the microphone and converts speech to text using Google's speech recognition."""
-    recognizer = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("\n[Robot Ears]: Listening... Speak now.")
-        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+# --- LangGraph Assistant Core ---
+class VoiceAssistantCore:
+    def __init__(self, model_name="qwen"):
         try:
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
-            print("[Robot Ears]: Processing audio...")
-            text = recognizer.recognize_google(audio)
-            print(f"You (Voice): {text}")
-            return text
-        except sr.WaitTimeoutError:
-            return ""
-        except sr.UnknownValueError:
-            print("[Robot Ears]: Could not understand audio.")
-            return ""
-        except Exception as e:
-            print(f"[Robot Ears Error]: {str(e)}")
-            return ""
-
-def main():
-    greeting = "Robo-Qwen Assistant voice interface online. Speak into your microphone or type 'exit' to quit."
-    print(greeting)
-    speak(greeting)
-    print("=" * 50)
-    
-    while True:
-        try:
-            mode = input("\nPress [Enter] to speak, or type your query (or 'exit'): ").strip()
+            self.llm = Ollama(model=model_name)
             
-            if mode.lower() in ['quit', 'exit', 'q']:
-                farewell = "Shutting down systems. Goodbye!"
-                print(f"\nRobo-Qwen: {farewell}")
-                speak(farewell)
-                break
+            workflow = StateGraph(state_schema=MessagesState)
             
-            if mode == "":
-                user_input = listen_to_microphone()
-                if not user_input:
-                    continue
-            else:
-                user_input = mode
+            def call_model(state: MessagesState):
+                messages = state["messages"]
+                prompt_history = "\n".join([
+                    f"User: {m.content}" if isinstance(m, HumanMessage) else f"Assistant: {m.content}"
+                    for m in messages[:-1]
+                ])
+                current_input = messages[-1].content
                 
-            response = robot_interact(user_input)
-            print(f"\nRobo-Qwen: {response}")
-            speak(response)
+                full_prompt = f"{prompt_history}\nUser: {current_input}\nAssistant:" if prompt_history else f"User: {current_input}\nAssistant:"
+                response_text = self.llm.invoke(full_prompt)
+                return {"messages": [AIMessage(content=response_text.strip())]}
+
+            workflow.add_node("model", call_model)
+            workflow.add_edge(START, "model")
+            workflow.add_edge("model", END)
+
+            self.memory = MemorySaver()
+            self.graph = workflow.compile(checkpointer=self.memory)
+            self.thread_config = {"configurable": {"thread_id": "desktop_voice_thread_1"}}
             
-        except KeyboardInterrupt:
-            print("\n\nRobo-Qwen: Emergency stop triggered. Goodbye!")
-            break
         except Exception as e:
-            err_msg = f"Error processing request: {str(e)}"
-            print(f"\nRobo-Qwen: {err_msg}")
-            speak("An internal system error occurred.")
+            self.llm = None
+            self.graph = None
+            print(f"Graph Initialization Error: {e}")
+
+        self.model_path = "en_US-lessac-medium.onnx"
+
+    def get_response(self, prompt):
+        if not self.graph:
+            return "Error: LangGraph or Ollama model is not initialized."
+        try:
+            input_message = HumanMessage(content=prompt)
+            output = self.graph.invoke({"messages": [input_message]}, self.thread_config)
+            return output["messages"][-1].content
+        except Exception as e:
+            return f"Generation Error: {str(e)}"
+
+    def speak(self, text):
+        try:
+            speech_file = tempfile.mktemp(suffix=".wav")
+            cmd = f"echo '{text}' | piper --model {self.model_path} --output_file {speech_file}"
+            subprocess.run(cmd, shell=True, check=True)
+            subprocess.run(f"mpv {speech_file} --no-video --really-quiet", shell=True)
+            if os.path.exists(speech_file):
+                os.remove(speech_file)
+        except Exception as e:
+            print(f"Speech Error: {e}")
+
+# --- Modern Tkinter UI ---
+class VoiceAssistantApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Robo-Qwen Voice Assistant")
+        self.root.geometry("750x580")
+        self.root.minsize(550, 420)
+
+        self.assistant = VoiceAssistantCore()
+        self.task_queue = queue.Queue()
+        self.recognizer = sr.Recognizer()
+        
+        # Adjust energy threshold to better handle normal speaking volume
+        self.recognizer.energy_threshold = 300
+        self.mic_index = None  # Set integer index if your default mic fails
+
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        
+        self.bg_color = "#1e1e1e"
+        self.fg_color = "#d4d4d4"
+        self.accent_color = "#007acc"
+        self.mic_color = "#28a745"
+        
+        self.root.configure(bg=self.bg_color)
+        self.create_widgets()
+        self.check_queue()
+
+    def create_widgets(self):
+        title_label = tk.Label(
+            self.root, 
+            text="Robo-Qwen Voice Assistant (LangGraph + Piper TTS)", 
+            font=("Segoe UI", 14, "bold"),
+            bg=self.bg_color, 
+            fg="#ffffff"
+        )
+        title_label.pack(pady=10)
+
+        chat_frame = tk.Frame(self.root, bg=self.bg_color)
+        chat_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+        self.chat_display = scrolledtext.ScrolledText(
+            chat_frame, 
+            wrap=tk.WORD, 
+            state='disabled',
+            font=("Segoe UI", 11),
+            bg="#252526",
+            fg=self.fg_color,
+            insertbackground="white",
+            borderwidth=0,
+            highlightthickness=0
+        )
+        self.chat_display.pack(fill=tk.BOTH, expand=True)
+
+        self.status_var = tk.StringVar(value="Ready")
+        status_bar = tk.Label(
+            self.root, 
+            textvariable=self.status_var, 
+            font=("Segoe UI", 9, "italic"),
+            bg=self.bg_color, 
+            fg="#858585",
+            anchor="w"
+        )
+        status_bar.pack(fill=tk.X, padx=15, pady=2)
+
+        input_frame = tk.Frame(self.root, bg=self.bg_color)
+        input_frame.pack(fill=tk.X, padx=15, pady=12)
+
+        self.input_field = tk.Entry(
+            input_frame, 
+            font=("Segoe UI", 12),
+            bg="#333333",
+            fg="#ffffff",
+            insertbackground="white",
+            relief=tk.FLAT
+        )
+        self.input_field.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, ipadx=5)
+        self.input_field.bind("<Return>", lambda event: self.on_send_text())
+
+        self.mic_button = tk.Button(
+            input_frame, 
+            text="🎤 Speak", 
+            command=self.on_mic_click,
+            font=("Segoe UI", 10, "bold"),
+            bg=self.mic_color,
+            fg="white",
+            relief=tk.FLAT,
+            padx=12,
+            pady=5,
+            cursor="hand2"
+        )
+        self.mic_button.pack(side=tk.RIGHT, padx=(8, 0))
+
+        self.send_button = tk.Button(
+            input_frame, 
+            text="Send", 
+            command=self.on_send_text,
+            font=("Segoe UI", 10, "bold"),
+            bg=self.accent_color,
+            fg="white",
+            relief=tk.FLAT,
+            padx=15,
+            pady=5,
+            cursor="hand2"
+        )
+        self.send_button.pack(side=tk.RIGHT, padx=(8, 0))
+
+    def append_chat(self, sender, message):
+        self.chat_display.configure(state='normal')
+        self.chat_display.insert(tk.END, f"{sender}: ", "bold")
+        self.chat_display.insert(tk.END, f"{message}\n\n")
+        self.chat_display.tag_config("bold", foreground="#4ec9b0", font=("Segoe UI", 11, "bold"))
+        self.chat_display.configure(state='disabled')
+        self.chat_display.see(tk.END)
+
+    def on_send_text(self):
+        user_text = self.input_field.get().strip()
+        if not user_text:
+            return
+        self.input_field.delete(0, tk.END)
+        self.process_user_query(user_text)
+
+    def on_mic_click(self):
+        self.lock_inputs()
+        self.status_var.set("Listening... Speak now (up to 30s)")
+        threading.Thread(target=self.listen_audio, daemon=True).start()
+
+    def listen_audio(self):
+        try:
+            # Buffer to let audio channel fully close from previous speech playback
+            time.sleep(0.8)
+
+            mic_kwargs = {}
+            if self.mic_index is not None:
+                mic_kwargs["device_index"] = self.mic_index
+
+            with sr.Microphone(**mic_kwargs) as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.8)
+                # Expanded phrase_time_limit to 30 seconds for longer inputs/song names
+                audio = self.recognizer.listen(source, timeout=None, phrase_time_limit=30.0)
+            
+            self.status_var.set("Processing voice input...")
+            query = self.recognizer.recognize_google(audio)
+            self.task_queue.put(("user_input", query))
+        except sr.WaitTimeoutError:
+            self.status_var.set("Ready (No speech detected)")
+            self.task_queue.put(("idle", ""))
+        except sr.UnknownValueError:
+            self.status_var.set("Ready (Could not understand audio)")
+            self.task_queue.put(("idle", ""))
+        except Exception as e:
+            print(f"Microphone Error Details: {e}")
+            self.status_var.set("Ready")
+            self.task_queue.put(("idle", ""))
+
+    def process_user_query(self, query):
+        self.lock_inputs()
+        self.append_chat("You", query)
+        self.status_var.set("LangGraph node processing...")
+        threading.Thread(target=self.run_assistant_pipeline, args=(query,), daemon=True).start()
+
+    def run_assistant_pipeline(self, query):
+        response_text = self.assistant.get_response(query)
+        self.task_queue.put(("response", response_text))
+        self.assistant.speak(response_text)
+        self.task_queue.put(("idle", ""))
+
+    def lock_inputs(self):
+        self.input_field.config(state='disabled')
+        self.send_button.config(state='disabled')
+        self.mic_button.config(state='disabled')
+
+    def check_queue(self):
+        try:
+            while True:
+                task_type, data = self.task_queue.get_nowait()
+                if task_type == "user_input":
+                    self.process_user_query(data)
+                elif task_type == "response":
+                    self.append_chat("Assistant", data)
+                elif task_type == "idle":
+                    self.input_field.config(state='normal')
+                    self.send_button.config(state='normal')
+                    self.mic_button.config(state='normal')
+                    self.status_var.set("Ready")
+                    self.input_field.focus()
+                self.task_queue.task_done()
+        except queue.Empty:
+            pass
+        
+        self.root.after(100, self.check_queue)
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = VoiceAssistantApp(root)
+    root.mainloop()
